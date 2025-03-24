@@ -1,10 +1,11 @@
 import datetime
 import logging
+from typing import Dict, List
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-def validate_data(data):
+def validate_data(data: Dict) -> None:
     """Validate required fields in ORDERS data."""
     required_fields = ["message_ref", "order_number", "order_date", "parties", "items"]
     for field in required_fields:
@@ -14,7 +15,7 @@ def validate_data(data):
         raise ValueError("ORDERS must contain at least one item.")
     logging.info("Data validation passed.")
 
-def generate_orders(data, filename="orders.edi"):
+def generate_orders(data: Dict, filename: str = "orders.edi") -> str:
     """Generate an EDIFACT ORDERS message and save to a file."""
     try:
         validate_data(data)
@@ -23,26 +24,26 @@ def generate_orders(data, filename="orders.edi"):
         return ""
 
     logging.info("Generating ORDERS message...")
-    
+
     edifact = [
         "UNA:+.? '",  # Service string advice
         f"UNH+{data['message_ref']}+ORDERS:D:96A:UN'"
     ]
-    
+
     edifact.append(f"BGM+220+{data['order_number']}+9'")  # 220 = Order
     edifact.append(f"DTM+137:{data['order_date']}:102'")
-    
+
     if "delivery_date" in data:
         edifact.append(f"DTM+2:{data['delivery_date']}:102'")
-    
+
     for party in data['parties']:
         if "qualifier" not in party or "id" not in party:
             logging.warning("Skipping invalid NAD entry: %s", party)
             continue
         edifact.append(f"NAD+{party['qualifier']}+{party['id']}::91'")
-    
+
     total_amount = 0.0
-    
+
     for index, item in enumerate(data['items'], start=1):
         if "product_code" not in item or "description" not in item or "quantity" not in item or "price" not in item:
             logging.warning("Skipping item due to missing fields: %s", item)
@@ -53,20 +54,24 @@ def generate_orders(data, filename="orders.edi"):
         edifact.append(f"PRI+AAA:{item['price']}:EA'")
         line_total = float(item['price']) * int(item['quantity'])
         total_amount += line_total
-    
+
     edifact.append(f"MOA+79:{total_amount:.2f}:'")  # Total order amount
-    
+
     if "special_instructions" in data:
         edifact.append(f"FTX+AAI+++{data['special_instructions']}'")
-    
+
     segment_count = len(edifact) - 1
     edifact.append(f"UNT+{segment_count}+{data['message_ref']}'")
-    
+
     edifact_message = "\n".join(edifact)
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write(edifact_message)
-    
-    logging.info("ORDERS message generated and saved to %s", filename)
+    try:
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(edifact_message)
+        logging.info("ORDERS message generated and saved to %s", filename)
+    except IOError as e:
+        logging.error("Failed to write ORDERS message to file: %s", e)
+        return ""
+
     return edifact_message
 
 # Example data
@@ -92,4 +97,3 @@ orders_message = generate_orders(orders_data)
 if orders_message:
     print("\nGenerated ORDERS Message:\n")
     print(orders_message)
-
