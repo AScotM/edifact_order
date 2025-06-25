@@ -1,154 +1,174 @@
 import logging
-from typing import Dict, List, Tuple, Union
+from dataclasses import dataclass
 from decimal import Decimal
+from typing import Dict, List, Literal, Optional, Tuple, TypedDict  # Added Tuple here
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 # Constants
-UNA = "UNA:+.? '"
+UNA_SEGMENT = "UNA:+.? '"
 ORDERS_MSG_TYPE = "ORDERS:D:96A:UN"
 DATE_FORMAT = "102"
 
-def validate_data(data: Dict[str, any]) -> None:
-    """Validate required fields in ORDERS data."""
+# TypedDict for type-safe data validation
+class OrderItem(TypedDict):
+    product_code: str
+    description: str
+    quantity: str
+    price: str
+
+class OrderParty(TypedDict):
+    qualifier: str
+    id: str
+    name: Optional[str]
+    address: Optional[str]
+
+class OrderData(TypedDict):
+    message_ref: str
+    order_number: str
+    order_date: str
+    parties: List[OrderParty]
+    items: List[OrderItem]
+    delivery_date: Optional[str]
+    currency: Optional[str]
+    delivery_location: Optional[str]
+    payment_terms: Optional[str]
+    tax_rate: Optional[str]
+    special_instructions: Optional[str]
+
+@dataclass
+class EdifactConfig:
+    """Configuration for EDIFACT generation."""
+    una_segment: str = UNA_SEGMENT
+    message_type: str = ORDERS_MSG_TYPE
+    date_format: str = DATE_FORMAT
+
+class EdifactGenerationError(Exception):
+    """Custom exception for EDIFACT generation failures."""
+    pass
+
+def validate_order_data(data: Dict) -> OrderData:
+    """Validate and normalize input data."""
     required_fields = ["message_ref", "order_number", "order_date", "parties", "items"]
-    for field in required_fields:
-        if not data.get(field):
-            raise ValueError(f"Missing required field: {field}")
+    if not all(field in data for field in required_fields):
+        raise EdifactGenerationError("Missing required fields.")
+
     if not isinstance(data["items"], list) or not data["items"]:
-        raise ValueError("ORDERS must contain at least one item.")
+        raise EdifactGenerationError("At least one item is required.")
 
-def format_party(party: Dict[str, str]) -> List[str]:
-    """Format party segments including optional contact and communication info."""
-    lines = []
-    if "qualifier" in party and "id" in party:
-        lines.append(f"NAD+{party['qualifier']}+{party['id']}::91'")
-        if "name" in party:
-            lines.append(f"CTA+IC+{party['name']}'")
-        if "address" in party:
-            lines.append(f"COM+{party['address']}:AD'")
-    return lines
+    return data  # type: ignore (TypedDict ensures type safety)
 
-def format_item(index: int, item: Dict[str, str]) -> Tuple[List[str], Decimal]:
-    """Format item segment and calculate line total."""
-    required = ["product_code", "description", "quantity", "price"]
-    if any(k not in item for k in required):
-        logging.warning("Skipping invalid item: %s", item)
-        return [], Decimal("0.00")
+def format_party(party: OrderParty) -> List[str]:
+    """Format NAD/CTA/COM segments for a party."""
+    segments = []
+    qualifier, party_id = party["qualifier"], party["id"]
+    segments.append(f"NAD+{qualifier}+{party_id}::91'")
 
+    if name := party.get("name"):
+        segments.append(f"CTA+IC+{name}'")
+
+    if address := party.get("address"):
+        segments.append(f"COM+{address}:AD'")
+
+    return segments
+
+def format_order_item(index: int, item: OrderItem) -> Tuple[List[str], Decimal]:
+    """Format LIN/IMD/QTY/PRI segments for an item."""
     quantity = int(item["quantity"])
     price = Decimal(item["price"])
-    total = quantity * price
+    line_total = quantity * price
 
-    lines = [
+    segments = [
         f"LIN+{index}++{item['product_code']}:EN'",
         f"IMD+F++:::{item['description']}'",
         f"QTY+21:{quantity}:EA'",
-        f"PRI+AAA:{price:.2f}:EA'"
+        f"PRI+AAA:{price:.2f}:EA'",
     ]
 
-    return lines, total
+    return segments, line_total
 
-def generate_orders(data: Dict[str, any], filename: str = "orders.edi", write_to_file: bool = True) -> str:
-    """Generate EDIFACT ORDERS message (D.96A) and optionally write to file."""
+def generate_edifact_orders(
+    data: Dict,
+    config: EdifactConfig = EdifactConfig(),
+    output_file: Optional[str] = None,
+) -> str:
+    """Generate EDIFACT ORDERS message."""
     try:
-        validate_data(data)
-    except ValueError as e:
-        logging.error(str(e))
-        return ""
+        validated_data = validate_order_data(data)
+    except EdifactGenerationError as e:
+        logger.error(f"Validation failed: {e}")
+        raise
 
-    logging.info("Generating ORDERS message...")
+    edifact_segments = [config.una_segment]
+    edifact_segments.append(f"UNH+{validated_data['message_ref']}+{config.message_type}'")
+    edifact_segments.append(f"BGM+220+{validated_data['order_number']}+9'")
+    edifact_segments.append(f"DTM+137:{validated_data['order_date']}:{config.date_format}'")
 
-    edifact = [UNA]
-    edifact.append(f"UNH+{data['message_ref']}+{ORDERS_MSG_TYPE}'")
-    edifact.append(f"BGM+220+{data['order_number']}+9'")
-    edifact.append(f"DTM+137:{data['order_date']}:{DATE_FORMAT}'")
+    # Optional segments
+    if delivery_date := validated_data.get("delivery_date"):
+        edifact_segments.append(f"DTM+2:{delivery_date}:{config.date_format}'")
 
-    if "delivery_date" in data:
-        edifact.append(f"DTM+2:{data['delivery_date']}:{DATE_FORMAT}'")
+    if currency := validated_data.get("currency"):
+        edifact_segments.append(f"CUX+2:{currency}:9'")
 
-    if "currency" in data:
-        edifact.append(f"CUX+2:{data['currency']}:9'")
+    # Process parties
+    for party in validated_data["parties"]:
+        edifact_segments.extend(format_party(party))
 
-    # Parties
-    for party in data["parties"]:
-        edifact.extend(format_party(party))
-
-    # Delivery location
-    if "delivery_location" in data:
-        edifact.append(f"LOC+7+{data['delivery_location']}::91'")  # 7 = Place of delivery
-
-    # Payment terms
-    if "payment_terms" in data:
-        edifact.append(f"PAT+1'")
-        edifact.append(f"DTM+13:{data['payment_terms']}:{DATE_FORMAT}'")  # 13 = Terms net due date
-
-    # Item lines
+    # Process items
     total_amount = Decimal("0.00")
-    for i, item in enumerate(data["items"], 1):
-        lines, line_total = format_item(i, item)
-        if lines:
-            edifact.extend(lines)
-            total_amount += line_total
+    for idx, item in enumerate(validated_data["items"], 1):
+        item_segments, line_total = format_order_item(idx, item)
+        edifact_segments.extend(item_segments)
+        total_amount += line_total
 
-    # Add TAX (example VAT at 20%)
-    if "tax_rate" in data:
-        tax_rate = Decimal(data["tax_rate"])
-        tax_amount = (total_amount * tax_rate / 100).quantize(Decimal("0.01"))
-        edifact.append(f"TAX+7+VAT+++::: {tax_rate:.2f}'")
-        edifact.append(f"MOA+124:{tax_amount:.2f}:'")  # 124 = Tax amount
-        grand_total = total_amount + tax_amount
-    else:
-        grand_total = total_amount
+    # Calculate taxes and totals
+    if tax_rate := validated_data.get("tax_rate"):
+        tax_amount = (total_amount * Decimal(tax_rate) / 100).quantize(Decimal("0.01"))
+        edifact_segments.extend([
+            f"TAX+7+VAT+++:::{tax_rate}%'",
+            f"MOA+124:{tax_amount:.2f}:'",
+        ])
+        total_amount += tax_amount
 
-    # Total monetary amount
-    edifact.append(f"MOA+79:{grand_total:.2f}:'")
+    edifact_segments.append(f"MOA+79:{total_amount:.2f}:'")
 
-    # Free-text instructions
-    if "special_instructions" in data:
-        edifact.append(f"FTX+AAI+++{data['special_instructions']}'")
+    # Finalize message
+    segment_count = len(edifact_segments) - 1  # Exclude UNA
+    edifact_segments.append(f"UNT+{segment_count}+{validated_data['message_ref']}'")
 
-    # Trailer
-    segment_count = len(edifact) - 1
-    edifact.append(f"UNT+{segment_count}+{data['message_ref']}'")
+    edifact_message = "\n".join(edifact_segments)
 
-    edifact_message = "\n".join(edifact)
-
-    if write_to_file:
+    if output_file:
         try:
-            with open(filename, "w", encoding="utf-8") as f:
+            with open(output_file, "w", encoding="utf-8") as f:
                 f.write(edifact_message)
-            logging.info("Message written to %s", filename)
+            logger.info(f"EDIFACT message written to {output_file}")
         except IOError as e:
-            logging.error("File write failed: %s", e)
+            logger.error(f"Failed to write file: {e}")
+            raise EdifactGenerationError("File write failed.") from e
 
     return edifact_message
 
-# Example usage
+# Example Usage
 if __name__ == "__main__":
-    sample_data = {
+    sample_order: OrderData = {
         "message_ref": "ORD0001",
         "order_number": "2025-0509-A",
         "order_date": "20250509",
-        "delivery_date": "20250512",
-        "currency": "EUR",
-        "delivery_location": "9876543210",
-        "payment_terms": "20250608",
-        "tax_rate": "20.0",
         "parties": [
-            {"qualifier": "BY", "id": "1234567890123", "name": "Buyer Corp", "address": "Main St 1"},
-            {"qualifier": "SU", "id": "3210987654321", "name": "Supplier Ltd", "address": "Industrial Park"},
-            {"qualifier": "DP", "id": "5678901234567", "name": "Delivery Place", "address": "Warehouse 4"}
+            {"qualifier": "BY", "id": "1234567890123", "name": "Buyer Corp"},
+            {"qualifier": "SU", "id": "3210987654321", "address": "Industrial Park"},
         ],
         "items": [
             {"product_code": "ITEM001", "description": "Widget A", "quantity": "10", "price": "12.50"},
-            {"product_code": "ITEM002", "description": "Gadget B", "quantity": "5", "price": "20.00"}
         ],
-        "special_instructions": "Deliver between 9 AM - 5 PM"
     }
 
-    message = generate_orders(sample_data)
-    if message:
-        print("\nGenerated EDIFACT ORDERS Message:\n")
-        print(message)
+    try:
+        message = generate_edifact_orders(sample_order, output_file="orders.edi")
+        print("\nGenerated EDIFACT ORDERS:\n", message)
+    except EdifactGenerationError:
+        print("Failed to generate EDIFACT message.")
